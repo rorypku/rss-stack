@@ -10,6 +10,11 @@ services:
       - "8080:80"
     volumes:
       - ./data/freshrss:/var/www/FreshRSS/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
     networks:
       - rssnet
 
@@ -17,6 +22,7 @@ services:
     image: python:3.10-slim
     container_name: rss_sync_worker
     restart: unless-stopped
+    mem_limit: 1g
     environment:
       # --- SiliconFlow Config ---
       - SILICONFLOW_API_KEY=${SILICONFLOW_API_KEY}
@@ -44,6 +50,11 @@ services:
     working_dir: /app/code
     command: >
       sh -c "pip install -r requirements.txt && python sync_daemon.py"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
     networks:
       - rssnet
 
@@ -54,6 +65,11 @@ services:
       - "3000:80"
     volumes:
       - ./config/rss-bridge:/config
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
     networks:
       - rssnet
 
@@ -78,6 +94,97 @@ services:
       driver: "json-file"
       options:
         max-size: "100m"
+        max-file: "3"
+    networks:
+      - rssnet
+
+  rsshub:
+    image: diygod/rsshub
+    container_name: rsshub
+    restart: unless-stopped
+    ports:
+      - "1200:1200"
+    environment:
+      NODE_ENV: production
+      CACHE_TYPE: redis
+      REDIS_URL: "redis://redis:6379/"
+      PUPPETEER_WS_ENDPOINT: "ws://browserless:3000"
+      PUPPETEER_REAL_BROWSER_SERVICE: "http://real-browser:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:1200/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      - redis
+      - browserless
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    networks:
+      - rssnet
+
+  real-browser:
+    image: ghcr.io/hyoban/puppeteer-real-browser-hono
+    container_name: real-browser
+    restart: always
+    mem_limit: 1g
+    ports:
+      - "3001:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    networks:
+      - rssnet
+
+  browserless:
+    image: browserless/chrome
+    container_name: browserless
+    restart: unless-stopped
+    mem_limit: 1g
+    ulimits:
+      core:
+        hard: 0
+        soft: 0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/pressure"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    networks:
+      - rssnet
+
+  redis:
+    image: redis:alpine
+    container_name: rsshub-redis
+    restart: unless-stopped
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 5s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
     networks:
       - rssnet
 
