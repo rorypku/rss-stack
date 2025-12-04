@@ -20,6 +20,12 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="maximum number of articles to return (default: 10)",
     )
+    parser.add_argument(
+        "--category",
+        type=str,
+        default=None,
+        help="optional FreshRSS category.name to filter results by",
+    )
     return parser.parse_args()
 
 
@@ -70,6 +76,14 @@ def main() -> None:
     idx = df.groupby("entry_id")["_distance"].idxmin()
     best_df = df.loc[idx].copy()
     best_df.sort_values("_distance", inplace=True)
+
+    # 可选：按 category.name 过滤
+    if args.category:
+        best_df = best_df[best_df["category_name"] == args.category]
+        if best_df.empty:
+            print(f"No results found for category: {args.category}")
+            return
+
     best_df = best_df.head(limit)
 
     # 懒删除：批量回查 SQLite，并删除已被 FreshRSS 删除的文章对应切片
