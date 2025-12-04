@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from openai import OpenAI
@@ -94,29 +95,25 @@ def main() -> None:
         print("No valid results after lazy deletion cleanup.")
         return
 
-    # 最终结果输出
-    for rank, row in enumerate(best_df.itertuples(index=False), start=1):
+    # 最终结果输出为 JSONL（一行一个 JSON 对象）
+    results: list[dict] = []
+    for row in best_df.itertuples(index=False):
         title = getattr(row, "title", "")
-        link = getattr(row, "link", "")
-        category_name = getattr(row, "category_name", None)
-        distance = getattr(row, "_distance", None)
+        entry_id = getattr(row, "entry_id", None)
         content = getattr(row, "content", "")
         snippet = (content[:200] + "...") if len(content) > 200 else content
 
-        parts = [f"[{rank}] {title}"]
-        if category_name:
-            parts.append(f"(category: {category_name})")
-        if distance is not None:
-            parts.append(f"(distance: {distance:.4f})")
-        if link:
-            parts.append(f"\n  Link: {link}")
-        if snippet:
-            parts.append(f"\n  Snippet: {snippet}")
+        results.append(
+            {
+                "title": title,
+                "entry.id": int(entry_id) if entry_id is not None else None,
+                "snippet": snippet,
+            },
+        )
 
-        print(" ".join(parts))
-        print()
+    for item in results:
+        print(json.dumps(item, ensure_ascii=False))
 
 
 if __name__ == "__main__":
     main()
-
