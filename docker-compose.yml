@@ -1,0 +1,86 @@
+
+services:
+  freshrss:
+    image: freshrss/freshrss:latest
+    container_name: freshrss
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - CRON_MIN=${CRON_MIN:-*/720}
+    ports:
+      - "8080:80"
+    volumes:
+      - ./data/freshrss:/var/www/FreshRSS/data
+    networks:
+      - rssnet
+
+  rss-sync:
+    image: python:3.10-slim
+    container_name: rss_sync_worker
+    restart: unless-stopped
+    environment:
+      # --- SiliconFlow Config ---
+      - SILICONFLOW_API_KEY=${SILICONFLOW_API_KEY}
+      - SILICONFLOW_BASE_URL=${SILICONFLOW_BASE_URL:-https://api.siliconflow.cn/v1}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-8B}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-4096}
+
+      # --- Tuning Params ---
+      - CHUNK_SIZE=${CHUNK_SIZE:-200}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-100}
+      - SEARCH_THRESHOLD=${SEARCH_THRESHOLD:-1} # [0, 2] 越小越严格
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-36000}
+      - RETENTION_DAYS=${RETENTION_DAYS:-90}
+      - LANCEDB_URI=${LANCEDB_URI:-/app/lancedb_data/freshrss}
+      - EMBEDDING_BATCH_SIZE=${EMBEDDING_BATCH_SIZE:-50}
+      - SYNC_CATEGORIES=${SYNC_CATEGORIES:-macro}
+      - PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
+    volumes:
+      # Freshrss SQLite 数据库（只读挂载）
+      - ./data/freshrss:/app/data:ro
+      # LanceDB 持久化目录
+      - ./data/lancedb:/app/lancedb_data
+      # 同步与搜索代码
+      - ./apps/freshrss-search:/app/code
+    working_dir: /app/code
+    command: >
+      sh -c "pip install -r requirements.txt && python sync_daemon.py"
+    networks:
+      - rssnet
+
+  rss-bridge:
+    image: rssbridge/rss-bridge
+    container_name: rss-bridge
+    ports:
+      - "3000:80"
+    volumes:
+      - ./config/rss-bridge:/config
+    networks:
+      - rssnet
+
+  wechat2rss:
+    image: "ttttmr/wechat2rss:latest"
+    container_name: wechat2rss
+    environment:
+      - LIC_EMAIL=${LIC_EMAIL} # 付款时备注的邮箱
+      - LIC_CODE=${LIC_CODE} # 激活码
+      - RSS_HOST=${RSS_HOST:-wechat2rss:8080} # 服务器地址
+      - RSS_PROXY_DISABLE_IMG=${RSS_PROXY_DISABLE_IMG:-1}
+    volumes:
+      - ./data/wechat2rss:/wechat2rss # 数据持久化保存
+    ports:
+      - "8081:8080" # 监听端口映射，例如修改到8081端口，8081:8080
+    deploy: # 自动重启策略
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+        window: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+    networks:
+      - rssnet
+
+networks:
+  rssnet:
+    driver: bridge

@@ -1,0 +1,5 @@
+lancedb
+pandas
+openai
+beautifulsoup4
+
