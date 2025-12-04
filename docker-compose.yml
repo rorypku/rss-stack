@@ -19,7 +19,10 @@ services:
       - rssnet
 
   rss-sync:
-    image: python:3.10-slim
+    build:
+      context: ./apps/freshrss-search
+      dockerfile: Dockerfile
+    image: rss-sync-worker
     container_name: rss_sync_worker
     restart: unless-stopped
     mem_limit: 1g
@@ -48,8 +51,7 @@ services:
       # 同步与搜索代码
       - ./apps/freshrss-search:/app/code
     working_dir: /app/code
-    command: >
-      sh -c "pip install -r requirements.txt && python sync_daemon.py"
+    command: python sync_daemon.py
     logging:
       driver: "json-file"
       options:
