@@ -3,4 +3,4 @@ data/
 config/rss-bridge/config/config.ini.php
 .DS_Store
 archive/
-
+__pycache__/
