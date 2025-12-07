@@ -112,6 +112,7 @@ services:
       REDIS_URL: "redis://redis:6379/"
       PUPPETEER_WS_ENDPOINT: "ws://browserless:3000"
       PUPPETEER_REAL_BROWSER_SERVICE: "http://real-browser:3000"
+      ZSXQ_ACCESS_TOKEN: ${ZSXQ_ACCESS_TOKEN}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:1200/healthz"]
       interval: 30s
