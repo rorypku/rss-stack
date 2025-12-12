@@ -101,7 +101,10 @@ services:
       - rssnet
 
   rsshub:
-    image: diygod/rsshub
+    build:
+      context: ./apps/rsshub-custom
+      dockerfile: Dockerfile
+    image: rsshub-custom
     container_name: rsshub
     restart: unless-stopped
     ports:
@@ -113,6 +116,8 @@ services:
       PUPPETEER_WS_ENDPOINT: "ws://browserless:3000"
       PUPPETEER_REAL_BROWSER_SERVICE: "http://real-browser:3000"
       ZSXQ_ACCESS_TOKEN: ${ZSXQ_ACCESS_TOKEN}
+      SEEKINGALPHA_COOKIE: ${SEEKINGALPHA_COOKIE}
+      CACHE_EXPIRE: ${CACHE_EXPIRE}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:1200/healthz"]
       interval: 30s
