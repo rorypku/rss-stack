@@ -5,5 +5,5 @@ cd /Users/kai/docker/rss-stack
 docker compose exec rss-sync python search.py --help
 
 # 实际检索示例：
-docker compose exec rss-sync python search.py "美联储的货币政策的最新方向是什么" --limit 20
+docker compose exec rss-sync python search.py "Oracle 财报怎么样" --limit 8
 ```

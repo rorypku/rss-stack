@@ -151,7 +151,7 @@ def filter_deleted_entries(results_df, *, table, sqlite_path: Path) -> tuple[Any
     filtered_df = results_df[~results_df["entry_id"].isin(missing_ids)]
 
     # 从 LanceDB 中批量删除对应切片
-    where = f"entry_id in [{', '.join(str(eid) for eid in missing_ids)}]"
+    where = f"entry_id IN ({', '.join(str(eid) for eid in missing_ids)})"
     try:
         table.delete(where=where)
     except Exception as exc:  # noqa: BLE001
@@ -245,27 +245,63 @@ def rerank_results(
     if scores is None:
         return results_df
 
-    rerank_df["_rerank_score"] = scores
-    rerank_df.sort_values("_rerank_score", ascending=False, inplace=True)
+    rerank_df["rerank_score"] = scores
+    rerank_df.sort_values("rerank_score", ascending=False, inplace=True)
     return rerank_df
 
 
-def _format_results_jsonl(rows: Iterable[Any], *, rerank_enabled: bool) -> list[dict[str, object]]:
+def _fetch_feed_id_to_name(*, sqlite_path: Path, feed_ids: Sequence[int]) -> dict[int, str]:
+    if not feed_ids:
+        return {}
+    if not sqlite_path.exists():
+        return {}
+    unique_ids = sorted({int(fid) for fid in feed_ids if fid is not None})
+    if not unique_ids:
+        return {}
+    placeholders = ",".join("?" for _ in unique_ids)
+    query = f"SELECT id, name FROM feed WHERE id IN ({placeholders})"
+    try:
+        with open_sqlite(sqlite_path) as conn:
+            cur = conn.execute(query, unique_ids)
+            mapping: dict[int, str] = {}
+            for row in cur.fetchall():
+                fid, name = row
+                if name:
+                    mapping[int(fid)] = str(name)
+            return mapping
+    except Exception as exc:  # noqa: BLE001
+        print(f"[search] Error reading feed names from FreshRSS sqlite at {sqlite_path}: {exc}")
+        return {}
+
+
+def _format_results_jsonl(
+    rows: Iterable[Any],
+    *,
+    rerank_enabled: bool,
+    feed_id_to_name: dict[int, str],
+) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
     for row in rows:
         title = getattr(row, "title", "")
-        entry_id = getattr(row, "entry_id", None)
-        content = getattr(row, "content", "")
-        snippet = (content[:200] + "...") if len(content) > 200 else content
+        feed_id = getattr(row, "feed_id", None)
+        chunk = getattr(row, "content", "")
+
+        feed_name: str | None = None
+        if feed_id is not None:
+            try:
+                feed_name = feed_id_to_name.get(int(feed_id))
+            except Exception:  # noqa: BLE001
+                feed_name = None
 
         item: dict[str, object] = {
+            "feed.name": feed_name,
             "title": title,
-            "entry.id": int(entry_id) if entry_id is not None else None,
-            "snippet": snippet,
+            "chunk": chunk,
         }
         if rerank_enabled:
-            score = getattr(row, "_rerank_score", None)
-            item["rerank_score"] = float(score) if score is not None else None
+            score = getattr(row, "rerank_score", None)
+            if score is not None:
+                item["rerank_score"] = float(score)
         results.append(item)
     return results
 
@@ -326,10 +362,22 @@ def main() -> None:
         rerank_candidates=rerank_candidates,
     ).head(limit)
 
+    feed_ids: list[int] = []
+    if "feed_id" in best_df.columns:
+        try:
+            feed_ids = [int(v) for v in best_df["feed_id"].dropna().unique().tolist()]
+        except Exception:  # noqa: BLE001
+            feed_ids = []
+    feed_id_to_name = _fetch_feed_id_to_name(
+        sqlite_path=settings.freshrss_sqlite_path,
+        feed_ids=feed_ids,
+    )
+
     # 最终结果输出为 JSONL（一行一个 JSON 对象）
     results = _format_results_jsonl(
         best_df.itertuples(index=False),
         rerank_enabled=rerank_enabled,
+        feed_id_to_name=feed_id_to_name,
     )
     for item in results:
         print(json.dumps(item, ensure_ascii=False))
