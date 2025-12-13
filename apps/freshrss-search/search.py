@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+import requests
 
 from openai import OpenAI
 
@@ -26,18 +29,38 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="optional FreshRSS category.name to filter results by",
     )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--rerank",
+        action="store_true",
+        help="enable rerank (overrides env RERANK_ENABLED)",
+    )
+    group.add_argument(
+        "--no-rerank",
+        action="store_true",
+        help="disable rerank (overrides env RERANK_ENABLED)",
+    )
+    parser.add_argument(
+        "--rerank-model",
+        type=str,
+        default=None,
+        help="override env RERANK_MODEL",
+    )
+    parser.add_argument(
+        "--rerank-candidates",
+        type=int,
+        default=None,
+        help="override env RERANK_CANDIDATES",
+    )
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
+def _clamp_positive(value: int, default: int) -> int:
+    return value if value and value > 0 else default
+
+
+def get_query_embedding(text: str) -> list[float] | None:
     settings = get_settings()
-    table = get_or_create_rss_chunks_table()
-
-    query = args.query
-    limit = args.limit if args.limit and args.limit > 0 else 10
-
-    # 先将查询文本转换为向量
     client = OpenAI(
         api_key=settings.siliconflow_api_key,
         base_url=settings.siliconflow_base_url,
@@ -45,86 +68,269 @@ def main() -> None:
     try:
         resp = client.embeddings.create(
             model=settings.embedding_model,
-            input=[query],
+            input=[text],
             dimensions=settings.embedding_dim,
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[search] Error calling embedding API: {exc}")
-        return
+        return None
 
     if not resp.data:
         print("[search] Empty embedding result for query.")
-        return
+        return None
 
-    query_vector = resp.data[0].embedding
+    return resp.data[0].embedding
 
-    # 取比最终展示更多的候选结果，再做阈值过滤与去重（纯向量搜索）
-    candidate_limit = limit * 5
+
+def search_vector_db(query_vector: Sequence[float], limit: int):
+    settings = get_settings()
+    table = get_or_create_rss_chunks_table()
+
+    # 多召回（纯向量搜索）：尽量避免过早过滤导致 rerank 没候选
+    candidate_limit = min(
+        limit * max(1, settings.search_candidate_multiplier),
+        max(limit, settings.search_candidate_cap),
+    )
 
     df = table.search(query_vector).limit(candidate_limit).to_pandas()
-    if df.empty:
-        print("No results found.")
-        return
+    return table, df
 
-    # 阈值过滤
-    df = df[df["_distance"] <= settings.search_threshold]
-    if df.empty:
-        print("No results within threshold.")
-        return
 
+def _apply_distance_threshold(df, *, threshold: float):
+    if df.empty:
+        return df
+    return df[df["_distance"] <= threshold]
+
+
+def _pick_best_per_entry(df):
+    if df.empty:
+        return df
     # 按 entry_id 选取距离最小的一条作为该文章的代表切片
     idx = df.groupby("entry_id")["_distance"].idxmin()
     best_df = df.loc[idx].copy()
     best_df.sort_values("_distance", inplace=True)
+    return best_df
 
-    # 可选：按 category.name 过滤
-    if args.category:
-        best_df = best_df[best_df["category_name"] == args.category]
-        if best_df.empty:
-            print(f"No results found for category: {args.category}")
-            return
 
-    best_df = best_df.head(limit)
+def _filter_by_category(results_df, *, category: str):
+    if results_df.empty:
+        return results_df
+    return results_df[results_df["category_name"] == category]
 
-    # 懒删除：批量回查 SQLite，并删除已被 FreshRSS 删除的文章对应切片
-    sqlite_path = Path("/app/data/users/kai/db.sqlite")
-    entry_ids = [int(eid) for eid in best_df["entry_id"].unique().tolist()]
 
-    with open_sqlite(sqlite_path) as conn:
-        existing_ids = fetch_existing_entry_ids(conn, entry_ids)
+def filter_deleted_entries(results_df, *, table, sqlite_path: Path) -> tuple[Any, list[int]]:
+    """
+    Lazy-delete entries that no longer exist in FreshRSS sqlite.
+    Returns (filtered_df, missing_ids).
+    """
+    if results_df.empty:
+        return results_df, []
+
+    if not sqlite_path.exists():
+        print(
+            f"[search] FreshRSS sqlite not found at {sqlite_path}; "
+            "skip lazy deletion cleanup (set FRESHRSS_SQLITE_PATH to configure).",
+        )
+        return results_df, []
+
+    entry_ids = [int(eid) for eid in results_df["entry_id"].unique().tolist()]
+    if not entry_ids:
+        return results_df, []
+
+    try:
+        with open_sqlite(sqlite_path) as conn:
+            existing_ids = fetch_existing_entry_ids(conn, entry_ids)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[search] Error opening FreshRSS sqlite at {sqlite_path}: {exc}")
+        return results_df, []
 
     missing_ids = sorted(set(entry_ids) - existing_ids)
-    if missing_ids:
-        # 从展示结果中剔除已被删除的文章
-        best_df = best_df[~best_df["entry_id"].isin(missing_ids)]
+    if not missing_ids:
+        return results_df, []
 
-        # 从 LanceDB 中批量删除对应切片
-        where = f"entry_id in [{', '.join(str(eid) for eid in missing_ids)}]"
-        try:
-            table.delete(where=where)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[search] Error during lazy deletion cleanup: {exc}")
+    filtered_df = results_df[~results_df["entry_id"].isin(missing_ids)]
 
-    if best_df.empty:
-        print("No valid results after lazy deletion cleanup.")
-        return
+    # 从 LanceDB 中批量删除对应切片
+    where = f"entry_id in [{', '.join(str(eid) for eid in missing_ids)}]"
+    try:
+        table.delete(where=where)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[search] Error during lazy deletion cleanup: {exc}")
 
-    # 最终结果输出为 JSONL（一行一个 JSON 对象）
-    results: list[dict] = []
-    for row in best_df.itertuples(index=False):
+    return filtered_df, missing_ids
+
+
+def _siliconflow_rerank(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    query: str,
+    documents: list[str],
+    timeout_seconds: int,
+) -> list[float] | None:
+    """
+    Call SiliconFlow rerank API and return per-document scores.
+    Expected response: {"results": [{"index": 0, "relevance_score": 0.98}, ...]}
+    """
+    if not documents:
+        return []
+    url = base_url.rstrip("/") + "/rerank"
+    payload = {
+        "model": model,
+        "query": query,
+        "documents": documents,
+        "return_documents": False,
+        "top_n": len(documents),
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=timeout_seconds)
+        resp.raise_for_status()
+        data: dict[str, Any] = resp.json()
+        results = data.get("results", [])
+        scores = [0.0] * len(documents)
+        for item in results:
+            idx = int(item.get("index"))
+            score = float(item.get("relevance_score"))
+            if 0 <= idx < len(scores):
+                scores[idx] = score
+        return scores
+    except Exception as exc:  # noqa: BLE001
+        print(f"[search] Rerank API error: {exc}")
+        return None
+
+
+def _iter_rerank_documents(rows: Iterable[Any], *, max_chars: int) -> list[str]:
+    documents: list[str] = []
+    max_chars = max(1, max_chars)
+    for row in rows:
+        title = getattr(row, "title", "") or ""
+        content = getattr(row, "content", "") or ""
+        doc = (title + "\n\n" + content).strip()
+        documents.append(doc[:max_chars])
+    return documents
+
+
+def rerank_results(
+    results_df,
+    *,
+    query: str,
+    limit: int,
+    rerank_enabled: bool,
+    rerank_model: str,
+    rerank_candidates: int,
+):
+    settings = get_settings()
+    if not rerank_enabled or results_df.empty:
+        return results_df
+
+    rerank_candidates = _clamp_positive(rerank_candidates, default=200)
+    rerank_candidates = max(limit, rerank_candidates)
+
+    rerank_df = results_df.head(rerank_candidates).copy()
+    documents = _iter_rerank_documents(
+        rerank_df.itertuples(index=False),
+        max_chars=settings.rerank_max_doc_chars,
+    )
+
+    scores = _siliconflow_rerank(
+        base_url=settings.siliconflow_base_url,
+        api_key=settings.siliconflow_api_key,
+        model=rerank_model,
+        query=query,
+        documents=documents,
+        timeout_seconds=max(1, settings.rerank_timeout_seconds),
+    )
+    if scores is None:
+        return results_df
+
+    rerank_df["_rerank_score"] = scores
+    rerank_df.sort_values("_rerank_score", ascending=False, inplace=True)
+    return rerank_df
+
+
+def _format_results_jsonl(rows: Iterable[Any], *, rerank_enabled: bool) -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    for row in rows:
         title = getattr(row, "title", "")
         entry_id = getattr(row, "entry_id", None)
         content = getattr(row, "content", "")
         snippet = (content[:200] + "...") if len(content) > 200 else content
 
-        results.append(
-            {
-                "title": title,
-                "entry.id": int(entry_id) if entry_id is not None else None,
-                "snippet": snippet,
-            },
-        )
+        item: dict[str, object] = {
+            "title": title,
+            "entry.id": int(entry_id) if entry_id is not None else None,
+            "snippet": snippet,
+        }
+        if rerank_enabled:
+            score = getattr(row, "_rerank_score", None)
+            item["rerank_score"] = float(score) if score is not None else None
+        results.append(item)
+    return results
 
+
+def main() -> None:
+    args = parse_args()
+    settings = get_settings()
+
+    query = args.query
+    limit = _clamp_positive(args.limit, default=10)
+
+    query_vector = get_query_embedding(query)
+    if query_vector is None:
+        return
+
+    table, df = search_vector_db(query_vector, limit)
+    if df.empty:
+        print("No results found.")
+        return
+
+    df = _apply_distance_threshold(df, threshold=settings.search_threshold)
+    if df.empty:
+        print("No results within threshold.")
+        return
+
+    best_df = _pick_best_per_entry(df)
+    if args.category:
+        best_df = _filter_by_category(best_df, category=args.category)
+        if best_df.empty:
+            print(f"No results found for category: {args.category}")
+            return
+
+    # 懒删除：批量回查 SQLite，并删除已被 FreshRSS 删除的文章对应切片
+    best_df, _missing_ids = filter_deleted_entries(
+        best_df,
+        table=table,
+        sqlite_path=settings.freshrss_sqlite_path,
+    )
+
+    if best_df.empty:
+        print("No valid results after lazy deletion cleanup.")
+        return
+
+    rerank_enabled = settings.rerank_enabled
+    if args.rerank:
+        rerank_enabled = True
+    if args.no_rerank:
+        rerank_enabled = False
+
+    rerank_model = args.rerank_model or settings.rerank_model
+    rerank_candidates = args.rerank_candidates or settings.rerank_candidates
+    best_df = rerank_results(
+        best_df,
+        query=query,
+        limit=limit,
+        rerank_enabled=rerank_enabled,
+        rerank_model=rerank_model,
+        rerank_candidates=rerank_candidates,
+    ).head(limit)
+
+    # 最终结果输出为 JSONL（一行一个 JSON 对象）
+    results = _format_results_jsonl(
+        best_df.itertuples(index=False),
+        rerank_enabled=rerank_enabled,
+    )
     for item in results:
         print(json.dumps(item, ensure_ascii=False))
 

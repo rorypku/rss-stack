@@ -2,4 +2,4 @@ lancedb
 pandas
 openai
 beautifulsoup4
-
+requests

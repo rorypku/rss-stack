@@ -1,5 +1,4 @@
 import time
-from pathlib import Path
 from typing import List
 
 from openai import OpenAI
@@ -17,8 +16,7 @@ def main() -> None:
         base_url=settings.siliconflow_base_url,
     )
 
-    # SQLite path is expected to be mounted at /app/data
-    sqlite_path = Path("/app/data/users/kai/db.sqlite")
+    sqlite_path = settings.freshrss_sqlite_path
 
     chunks_table = get_or_create_rss_chunks_table()
     state = load_sync_state()
@@ -27,9 +25,18 @@ def main() -> None:
     print(f"LanceDB table: {chunks_table.name}")
     print(f"Last entry id: {state.last_entry_id}")
     print(f"Check interval: {settings.check_interval} seconds")
+    print(f"FreshRSS sqlite path: {sqlite_path}")
 
     while True:
         try:
+            if not sqlite_path.exists():
+                print(
+                    f"[sync_daemon] FreshRSS sqlite not found at {sqlite_path}; "
+                    "set FRESHRSS_SQLITE_PATH to configure.",
+                )
+                time.sleep(settings.check_interval)
+                continue
+
             with open_sqlite(sqlite_path) as conn:
                 max_entry_id = state.last_entry_id
                 text_batch: list[str] = []
