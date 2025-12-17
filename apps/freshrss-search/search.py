@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
         "--limit",
         type=int,
         default=10,
-        help="maximum number of articles to return (default: 10)",
+        help="maximum number of chunks to return (default: 10)",
     )
     parser.add_argument(
         "--category",
@@ -102,12 +102,14 @@ def _apply_distance_threshold(df, *, threshold: float):
     return df[df["_distance"] <= threshold]
 
 
-def _pick_best_per_entry(df):
+def _pick_best_per_entry(df, *, max_chunks: int = 1):
     if df.empty:
         return df
-    # 按 entry_id 选取距离最小的一条作为该文章的代表切片
-    idx = df.groupby("entry_id")["_distance"].idxmin()
-    best_df = df.loc[idx].copy()
+    max_chunks = max(1, int(max_chunks))
+
+    # 按 entry_id 选取距离最小的前 N 条切片作为候选（N=1 时用于去重展示）
+    df_sorted = df.sort_values(["entry_id", "_distance"], ascending=[True, True], kind="mergesort")
+    best_df = df_sorted.groupby("entry_id").head(max_chunks).copy()
     best_df.sort_values("_distance", inplace=True)
     return best_df
 
@@ -313,6 +315,12 @@ def main() -> None:
     query = args.query
     limit = _clamp_positive(args.limit, default=10)
 
+    rerank_enabled = settings.rerank_enabled
+    if args.rerank:
+        rerank_enabled = True
+    if args.no_rerank:
+        rerank_enabled = False
+
     query_vector = get_query_embedding(query)
     if query_vector is None:
         return
@@ -327,7 +335,9 @@ def main() -> None:
         print("No results within threshold.")
         return
 
-    best_df = _pick_best_per_entry(df)
+    # Rerank 前每篇文章最多选取 2 个候选切片，避免只靠单个 chunk 表达不足。
+    max_chunks_per_entry = 2 if rerank_enabled else 1
+    best_df = _pick_best_per_entry(df, max_chunks=max_chunks_per_entry)
     if args.category:
         best_df = _filter_by_category(best_df, category=args.category)
         if best_df.empty:
@@ -345,14 +355,10 @@ def main() -> None:
         print("No valid results after lazy deletion cleanup.")
         return
 
-    rerank_enabled = settings.rerank_enabled
-    if args.rerank:
-        rerank_enabled = True
-    if args.no_rerank:
-        rerank_enabled = False
-
     rerank_model = args.rerank_model or settings.rerank_model
     rerank_candidates = args.rerank_candidates or settings.rerank_candidates
+    if rerank_enabled:
+        rerank_candidates = max(rerank_candidates, limit * max_chunks_per_entry)
     best_df = rerank_results(
         best_df,
         query=query,
@@ -360,7 +366,8 @@ def main() -> None:
         rerank_enabled=rerank_enabled,
         rerank_model=rerank_model,
         rerank_candidates=rerank_candidates,
-    ).head(limit)
+    )
+    best_df = best_df.head(limit)
 
     feed_ids: list[int] = []
     if "feed_id" in best_df.columns:
