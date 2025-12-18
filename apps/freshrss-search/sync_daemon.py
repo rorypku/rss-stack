@@ -1,11 +1,84 @@
 import time
-from typing import List
+from typing import Sequence
 
 from openai import OpenAI
 
 from config import get_settings
 from db_utils import EntryRow, clean_html_content, chunk_text, iter_new_entries, open_sqlite
 from lancedb_utils import get_or_create_rss_chunks_table, load_sync_state, save_sync_state
+
+
+def _embed_texts(
+    client: OpenAI,
+    texts: Sequence[str],
+    *,
+    model: str,
+    dimensions: int,
+    batch_size: int,
+) -> list[list[float]] | None:
+    if not texts:
+        return []
+
+    batch_size = max(1, int(batch_size))
+    vectors: list[list[float]] = []
+    for start in range(0, len(texts), batch_size):
+        batch = list(texts[start : start + batch_size])
+        try:
+            response = client.embeddings.create(
+                model=model,
+                input=batch,
+                dimensions=dimensions,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[sync_daemon] Error during embedding batch call: {exc}")
+            return None
+
+        batch_vectors = [item.embedding for item in response.data]
+        if len(batch_vectors) != len(batch):
+            print(
+                "[sync_daemon] Embedding batch size mismatch: "
+                f"texts={len(batch)}, vectors={len(batch_vectors)}",
+            )
+            return None
+        vectors.extend(batch_vectors)
+
+    return vectors
+
+
+def _build_entry_rows(entry: EntryRow, chunks: Sequence[str]) -> list[dict]:
+    rows: list[dict] = []
+    for idx, chunk in enumerate(chunks):
+        rows.append(
+            {
+                "entry_id": entry.entry_id,
+                "published_at": entry.date,
+                "feed_id": entry.feed_id,
+                "category_id": entry.category_id,
+                "category_name": entry.category_name,
+                "title": entry.title,
+                "link": entry.link,
+                "chunk_index": idx,
+                "content": chunk,
+            }
+        )
+    return rows
+
+
+def _flush_entry_batch(chunks_table, *, entry_ids: Sequence[int], records: Sequence[dict]) -> None:
+    if not entry_ids:
+        return
+    where = f"entry_id IN ({', '.join(str(int(eid)) for eid in entry_ids)})"
+    try:
+        chunks_table.delete(where=where)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[sync_daemon] Error deleting existing chunks for batch: {exc}")
+
+    if not records:
+        return
+    try:
+        chunks_table.add(list(records))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[sync_daemon] Error adding batch to LanceDB: {exc}")
 
 
 def main() -> None:
@@ -39,9 +112,9 @@ def main() -> None:
 
             with open_sqlite(sqlite_path) as conn:
                 max_entry_id = state.last_entry_id
-                text_batch: list[str] = []
-                row_batch: list[dict] = []
-                batch_size = settings.embedding_batch_size
+                pending_entry_ids: list[int] = []
+                pending_records: list[dict] = []
+                entry_batch_size = max(1, int(settings.sync_entry_batch_size))
 
                 for entry in iter_new_entries(conn, last_entry_id=state.last_entry_id):
                     max_entry_id = max(max_entry_id, entry.entry_id)
@@ -58,28 +131,47 @@ def main() -> None:
                     if not chunks:
                         continue
 
-                    for idx, chunk in enumerate(chunks):
-                        text_batch.append(chunk)
-                        row_batch.append(
-                            {
-                                "entry_id": entry.entry_id,
-                                "published_at": entry.date,
-                                "feed_id": entry.feed_id,
-                                "category_id": entry.category_id,
-                                "category_name": entry.category_name,
-                                "title": entry.title,
-                                "link": entry.link,
-                                "chunk_index": idx,
-                                "content": chunk,
-                            }
+                    vectors = _embed_texts(
+                        client,
+                        chunks,
+                        model=settings.embedding_model,
+                        dimensions=settings.embedding_dim,
+                        batch_size=settings.embedding_batch_size,
+                    )
+                    if vectors is None:
+                        continue
+
+                    entry_rows = _build_entry_rows(entry, chunks)
+                    if len(entry_rows) != len(vectors):
+                        print(
+                            "[sync_daemon] Embedding size mismatch for entry: "
+                            f"entry_id={entry.entry_id}, chunks={len(entry_rows)}, vectors={len(vectors)}",
                         )
+                        continue
 
-                        if len(text_batch) >= batch_size:
-                            _flush_batch(client, chunks_table, text_batch, row_batch, settings)
+                    for row, vec in zip(entry_rows, vectors):
+                        pending_records.append({**row, "vector": vec})
+                    pending_entry_ids.append(entry.entry_id)
 
-                # Flush remaining batch
-                if text_batch:
-                    _flush_batch(client, chunks_table, text_batch, row_batch, settings)
+                    # 按 Entry 数触发 flush：减少 LanceDB delete 次数（delete 通常更昂贵）
+                    if len(pending_entry_ids) >= entry_batch_size:
+                        _flush_entry_batch(
+                            chunks_table,
+                            entry_ids=pending_entry_ids,
+                            records=pending_records,
+                        )
+                        pending_entry_ids.clear()
+                        pending_records.clear()
+
+                # Flush remaining entries
+                if pending_entry_ids:
+                    _flush_entry_batch(
+                        chunks_table,
+                        entry_ids=pending_entry_ids,
+                        records=pending_records,
+                    )
+                    pending_entry_ids.clear()
+                    pending_records.clear()
 
                 # Update sync state if we processed new entries
                 if max_entry_id > state.last_entry_id:
@@ -110,51 +202,6 @@ def run_ttl_cleanup(chunks_table, retention_days: int) -> None:
         chunks_table.delete(where=where, params=params)
     except Exception as exc:  # noqa: BLE001
         print(f"[sync_daemon] Error during TTL cleanup: {exc}")
-
-
-def _flush_batch(
-    client: OpenAI,
-    chunks_table,
-    text_batch: List[str],
-    row_batch: List[dict],
-    settings,
-) -> None:
-    """
-    调用 SiliconFlow Embedding API，对当前批次的文本生成向量并写入 LanceDB。
-    """
-    try:
-        response = client.embeddings.create(
-            model=settings.embedding_model,
-            input=text_batch,
-            dimensions=settings.embedding_dim,
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"[sync_daemon] Error during embedding batch call: {exc}")
-        # 丢弃本批次，避免阻塞后续同步
-        text_batch.clear()
-        row_batch.clear()
-        return
-
-    vectors = [item.embedding for item in response.data]
-    if len(vectors) != len(row_batch):
-        print(
-            f"[sync_daemon] Embedding batch size mismatch: texts={len(text_batch)}, vectors={len(vectors)}",
-        )
-        text_batch.clear()
-        row_batch.clear()
-        return
-
-    records = []
-    for row, vec in zip(row_batch, vectors):
-        records.append({**row, "vector": vec})
-
-    try:
-        chunks_table.add(records)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[sync_daemon] Error adding batch to LanceDB: {exc}")
-
-    text_batch.clear()
-    row_batch.clear()
 
 
 if __name__ == "__main__":

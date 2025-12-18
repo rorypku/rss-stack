@@ -77,6 +77,7 @@ class Settings:
         )
         self.embedding_dim = get_env_int("EMBEDDING_DIM", default=4096)
         self.embedding_batch_size = get_env_int("EMBEDDING_BATCH_SIZE", default=20)
+        self.sync_entry_batch_size = get_env_int("SYNC_ENTRY_BATCH_SIZE", default=20)
 
         # Chunking / search
         self.chunk_size = get_env_int("CHUNK_SIZE", default=200)

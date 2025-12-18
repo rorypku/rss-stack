@@ -103,6 +103,8 @@ def iter_new_entries(
         in_clause = ",".join(category_param_names)
         base_query += f" AND f.category IN ({in_clause})"
 
+    base_query += " ORDER BY e.id ASC"
+
     cur = conn.execute(base_query, params)
 
     for row in cur.fetchall():
@@ -204,4 +206,3 @@ def fetch_existing_entry_ids(
         else:
             ids.add(int(row))
     return ids
-

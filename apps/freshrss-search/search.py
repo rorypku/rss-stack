@@ -109,6 +109,8 @@ def _pick_best_per_entry(df, *, max_chunks: int = 1):
 
     # 按 entry_id 选取距离最小的前 N 条切片作为候选（N=1 时用于去重展示）
     df_sorted = df.sort_values(["entry_id", "_distance"], ascending=[True, True], kind="mergesort")
+    # 组内去重：过滤掉同一篇文章下内容完全重复的切片（应对数据库脏数据）
+    df_sorted = df_sorted.drop_duplicates(subset=["entry_id", "content"])
     best_df = df_sorted.groupby("entry_id").head(max_chunks).copy()
     best_df.sort_values("_distance", inplace=True)
     return best_df
