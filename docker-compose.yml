@@ -127,6 +127,7 @@ services:
       PUPPETEER_REAL_BROWSER_SERVICE: "http://real-browser:3000"
       ZSXQ_ACCESS_TOKEN: ${ZSXQ_ACCESS_TOKEN}
       SEEKINGALPHA_COOKIE: ${SEEKINGALPHA_COOKIE}
+      TWITTER_AUTH_TOKEN: ${TWITTER_AUTH_TOKEN_COOKIE}
       CACHE_EXPIRE: ${CACHE_EXPIRE}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:1200/healthz"]
