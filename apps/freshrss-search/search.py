@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -318,11 +320,60 @@ def _fetch_feed_id_to_name(*, sqlite_path: Path, feed_ids: Sequence[int]) -> dic
         return {}
 
 
+def _normalize_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, float) and math.isnan(value):
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+
+    try:
+        return int(value)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _format_epoch_seconds_to_date(value: object) -> str | None:
+    ts = _normalize_int(value)
+    if ts is None or ts <= 0:
+        return None
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+
+def _fetch_entry_id_to_published_date(*, sqlite_path: Path, entry_ids: Sequence[int]) -> dict[int, str]:
+    if not entry_ids:
+        return {}
+    if not sqlite_path.exists():
+        return {}
+    unique_ids = sorted({int(eid) for eid in entry_ids if eid is not None})
+    if not unique_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in unique_ids)
+    query = f"SELECT id, date FROM entry WHERE id IN ({placeholders})"
+    try:
+        with open_sqlite(sqlite_path) as conn:
+            cur = conn.execute(query, unique_ids)
+            mapping: dict[int, str] = {}
+            for row in cur.fetchall():
+                entry_id, raw_date = row
+                published_date = _format_epoch_seconds_to_date(raw_date)
+                if published_date is not None:
+                    mapping[int(entry_id)] = published_date
+            return mapping
+    except Exception as exc:  # noqa: BLE001
+        print(f"[search] Error reading entry dates from FreshRSS sqlite at {sqlite_path}: {exc}")
+        return {}
+
+
 def _format_results_jsonl(
     rows: Iterable[Any],
     *,
     rerank_enabled: bool,
     feed_id_to_name: dict[int, str],
+    entry_id_to_published_date: dict[int, str],
 ) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
     for row in rows:
@@ -337,10 +388,22 @@ def _format_results_jsonl(
             except Exception:  # noqa: BLE001
                 feed_name = None
 
+        published_date: str | None = None
+        entry_id = getattr(row, "entry_id", None)
+        if entry_id is not None:
+            try:
+                published_date = entry_id_to_published_date.get(int(entry_id))
+            except Exception:  # noqa: BLE001
+                published_date = None
+
+        if published_date is None:
+            published_date = _format_epoch_seconds_to_date(getattr(row, "published_at", None))
+
         item: dict[str, object] = {
             "feed.name": feed_name,
             "title": title,
             "chunk": chunk,
+            "published_date": published_date,
         }
         if rerank_enabled:
             score = getattr(row, "rerank_score", None)
@@ -431,11 +494,23 @@ def main() -> None:
         feed_ids=feed_ids,
     )
 
+    entry_ids: list[int] = []
+    if "entry_id" in best_df.columns:
+        try:
+            entry_ids = [int(v) for v in best_df["entry_id"].dropna().unique().tolist()]
+        except Exception:  # noqa: BLE001
+            entry_ids = []
+    entry_id_to_published_date = _fetch_entry_id_to_published_date(
+        sqlite_path=settings.freshrss_sqlite_path,
+        entry_ids=entry_ids,
+    )
+
     # 最终结果输出为 JSONL（一行一个 JSON 对象）
     results = _format_results_jsonl(
         best_df.itertuples(index=False),
         rerank_enabled=rerank_enabled,
         feed_id_to_name=feed_id_to_name,
+        entry_id_to_published_date=entry_id_to_published_date,
     )
     for item in results:
         print(json.dumps(item, ensure_ascii=False))
