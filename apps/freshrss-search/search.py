@@ -29,6 +29,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="optional FreshRSS category.name to filter results by",
     )
+    parser.add_argument(
+        "--feed",
+        type=str,
+        default=None,
+        help="optional FreshRSS feed.id (or feed.name) to filter results by",
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--rerank",
@@ -120,6 +126,40 @@ def _filter_by_category(results_df, *, category: str):
     if results_df.empty:
         return results_df
     return results_df[results_df["category_name"] == category]
+
+
+def _resolve_feed_ids(*, sqlite_path: Path, feed: str) -> list[int]:
+    feed = (feed or "").strip()
+    if not feed:
+        return []
+
+    try:
+        return [int(feed)]
+    except ValueError:
+        pass
+
+    if not sqlite_path.exists():
+        return []
+
+    query = "SELECT id FROM feed WHERE name = ?"
+    try:
+        with open_sqlite(sqlite_path) as conn:
+            cur = conn.execute(query, [feed])
+            return [int(row[0]) for row in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        print(f"[search] Error reading feed ids from FreshRSS sqlite at {sqlite_path}: {exc}")
+        return []
+
+
+def _filter_by_feed_ids(results_df, *, feed_ids: Sequence[int]):
+    if results_df.empty:
+        return results_df
+    if "feed_id" not in results_df.columns:
+        return results_df.iloc[0:0]
+    normalized_feed_ids = [int(fid) for fid in feed_ids if fid is not None]
+    if not normalized_feed_ids:
+        return results_df.iloc[0:0]
+    return results_df[results_df["feed_id"].isin(normalized_feed_ids)]
 
 
 def filter_deleted_entries(results_df, *, table, sqlite_path: Path) -> tuple[Any, list[int]]:
@@ -344,6 +384,15 @@ def main() -> None:
         best_df = _filter_by_category(best_df, category=args.category)
         if best_df.empty:
             print(f"No results found for category: {args.category}")
+            return
+    if args.feed:
+        feed_ids = _resolve_feed_ids(sqlite_path=settings.freshrss_sqlite_path, feed=args.feed)
+        if not feed_ids:
+            print(f"No such feed (id or name): {args.feed}")
+            return
+        best_df = _filter_by_feed_ids(best_df, feed_ids=feed_ids)
+        if best_df.empty:
+            print(f"No results found for feed: {args.feed}")
             return
 
     # 懒删除：批量回查 SQLite，并删除已被 FreshRSS 删除的文章对应切片
