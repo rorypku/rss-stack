@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+import pandas as pd
 import requests
 
 from openai import OpenAI
@@ -18,7 +20,7 @@ from lancedb_utils import get_or_create_rss_chunks_table
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Search FreshRSS semantic index (LanceDB).")
-    parser.add_argument("query", help="search query text")
+    parser.add_argument("query", nargs="+", help="one or more search queries")
     parser.add_argument(
         "--limit",
         type=int,
@@ -60,6 +62,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="override env RERANK_CANDIDATES",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="max parallel workers for search/rerank (default: auto)",
+    )
     return parser.parse_args()
 
 
@@ -67,27 +75,87 @@ def _clamp_positive(value: int, default: int) -> int:
     return value if value and value > 0 else default
 
 
-def get_query_embedding(text: str) -> list[float] | None:
+def _embed_texts(
+    client: OpenAI,
+    texts: Sequence[str],
+    *,
+    model: str,
+    dimensions: int,
+    batch_size: int,
+) -> list[list[float]] | None:
+    if not texts:
+        return []
+
+    batch_size = max(1, int(batch_size))
+    vectors: list[list[float]] = []
+    for start in range(0, len(texts), batch_size):
+        batch = list(texts[start : start + batch_size])
+        try:
+            resp = client.embeddings.create(
+                model=model,
+                input=batch,
+                dimensions=dimensions,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[search] Error calling embedding API: {exc}")
+            return None
+
+        if not resp.data:
+            print("[search] Empty embedding result for query batch.")
+            return None
+
+        batch_vectors: list[list[float] | None] = [None] * len(batch)
+        has_index = True
+        for item in resp.data:
+            idx = getattr(item, "index", None)
+            if idx is None:
+                has_index = False
+                break
+            try:
+                idx = int(idx)
+            except Exception:  # noqa: BLE001
+                has_index = False
+                break
+            if 0 <= idx < len(batch_vectors):
+                batch_vectors[idx] = item.embedding
+
+        if not has_index or any(vec is None for vec in batch_vectors):
+            fallback_vectors = [item.embedding for item in resp.data]
+            if len(fallback_vectors) != len(batch):
+                print(
+                    "[search] Embedding batch size mismatch: "
+                    f"texts={len(batch)}, vectors={len(fallback_vectors)}",
+                )
+                return None
+            vectors.extend(fallback_vectors)
+            continue
+
+        vectors.extend([vec for vec in batch_vectors if vec is not None])
+
+    return vectors
+
+
+def get_query_embeddings(texts: Sequence[str]) -> list[list[float]] | None:
     settings = get_settings()
     client = OpenAI(
         api_key=settings.siliconflow_api_key,
         base_url=settings.siliconflow_base_url,
     )
-    try:
-        resp = client.embeddings.create(
-            model=settings.embedding_model,
-            input=[text],
-            dimensions=settings.embedding_dim,
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"[search] Error calling embedding API: {exc}")
-        return None
 
-    if not resp.data:
-        print("[search] Empty embedding result for query.")
-        return None
+    return _embed_texts(
+        client,
+        texts,
+        model=settings.embedding_model,
+        dimensions=settings.embedding_dim,
+        batch_size=settings.embedding_batch_size,
+    )
 
-    return resp.data[0].embedding
+
+def get_query_embedding(text: str) -> list[float] | None:
+    vectors = get_query_embeddings([text])
+    if vectors is None or not vectors:
+        return None
+    return vectors[0]
 
 
 def search_vector_db(query_vector: Sequence[float], limit: int):
@@ -164,6 +232,24 @@ def _filter_by_feed_ids(results_df, *, feed_ids: Sequence[int]):
     return results_df[results_df["feed_id"].isin(normalized_feed_ids)]
 
 
+def _fetch_existing_entry_ids_batched(
+    conn,
+    entry_ids: Sequence[int],
+    *,
+    batch_size: int = 900,
+) -> set[int]:
+    unique_ids = [int(eid) for eid in entry_ids if eid is not None]
+    if not unique_ids:
+        return set()
+
+    batch_size = max(1, int(batch_size))
+    existing_ids: set[int] = set()
+    for start in range(0, len(unique_ids), batch_size):
+        batch = unique_ids[start : start + batch_size]
+        existing_ids |= fetch_existing_entry_ids(conn, list(batch))
+    return existing_ids
+
+
 def filter_deleted_entries(results_df, *, table, sqlite_path: Path) -> tuple[Any, list[int]]:
     """
     Lazy-delete entries that no longer exist in FreshRSS sqlite.
@@ -185,7 +271,7 @@ def filter_deleted_entries(results_df, *, table, sqlite_path: Path) -> tuple[Any
 
     try:
         with open_sqlite(sqlite_path) as conn:
-            existing_ids = fetch_existing_entry_ids(conn, entry_ids)
+            existing_ids = _fetch_existing_entry_ids_batched(conn, entry_ids)
     except Exception as exc:  # noqa: BLE001
         print(f"[search] Error opening FreshRSS sqlite at {sqlite_path}: {exc}")
         return results_df, []
@@ -413,11 +499,32 @@ def _format_results_jsonl(
     return results
 
 
+def _normalize_queries(raw_queries: Sequence[str]) -> list[str]:
+    queries: list[str] = []
+    for raw_query in raw_queries:
+        query = (raw_query or "").strip()
+        if query:
+            queries.append(query)
+    return queries
+
+
+def _resolve_max_workers(value: int | None, *, task_count: int, default_cap: int = 8) -> int:
+    if task_count <= 1:
+        return 1
+    if value is not None and int(value) > 0:
+        return min(int(value), task_count)
+    return min(default_cap, task_count)
+
+
 def main() -> None:
     args = parse_args()
     settings = get_settings()
 
-    query = args.query
+    queries = _normalize_queries(args.query)
+    if not queries:
+        print("No query provided.")
+        return
+
     limit = _clamp_positive(args.limit, default=10)
 
     rerank_enabled = settings.rerank_enabled
@@ -426,94 +533,245 @@ def main() -> None:
     if args.no_rerank:
         rerank_enabled = False
 
-    query_vector = get_query_embedding(query)
-    if query_vector is None:
-        return
-
-    table, df = search_vector_db(query_vector, limit)
-    if df.empty:
-        print("No results found.")
-        return
-
-    df = _apply_distance_threshold(df, threshold=settings.search_threshold)
-    if df.empty:
-        print("No results within threshold.")
-        return
-
-    # Rerank 前每篇文章最多选取 2 个候选切片，避免只靠单个 chunk 表达不足。
-    max_chunks_per_entry = 2 if rerank_enabled else 1
-    best_df = _pick_best_per_entry(df, max_chunks=max_chunks_per_entry)
-    if args.category:
-        best_df = _filter_by_category(best_df, category=args.category)
-        if best_df.empty:
-            print(f"No results found for category: {args.category}")
-            return
+    # Resolve optional feed filter once (shared across all queries).
+    feed_ids_filter: list[int] = []
     if args.feed:
-        feed_ids = _resolve_feed_ids(sqlite_path=settings.freshrss_sqlite_path, feed=args.feed)
-        if not feed_ids:
+        feed_ids_filter = _resolve_feed_ids(sqlite_path=settings.freshrss_sqlite_path, feed=args.feed)
+        if not feed_ids_filter:
             print(f"No such feed (id or name): {args.feed}")
             return
-        best_df = _filter_by_feed_ids(best_df, feed_ids=feed_ids)
-        if best_df.empty:
-            print(f"No results found for feed: {args.feed}")
+
+    # Single-query path: keep existing behavior and messages.
+    if len(queries) == 1:
+        query = queries[0]
+        query_vector = get_query_embedding(query)
+        if query_vector is None:
             return
 
-    # 懒删除：批量回查 SQLite，并删除已被 FreshRSS 删除的文章对应切片
-    best_df, _missing_ids = filter_deleted_entries(
-        best_df,
-        table=table,
-        sqlite_path=settings.freshrss_sqlite_path,
-    )
+        table, df = search_vector_db(query_vector, limit)
+        if df.empty:
+            print("No results found.")
+            return
 
-    if best_df.empty:
-        print("No valid results after lazy deletion cleanup.")
+        df = _apply_distance_threshold(df, threshold=settings.search_threshold)
+        if df.empty:
+            print("No results within threshold.")
+            return
+
+        # Rerank 前每篇文章最多选取 2 个候选切片，避免只靠单个 chunk 表达不足。
+        max_chunks_per_entry = 2 if rerank_enabled else 1
+        best_df = _pick_best_per_entry(df, max_chunks=max_chunks_per_entry)
+        if args.category:
+            best_df = _filter_by_category(best_df, category=args.category)
+            if best_df.empty:
+                print(f"No results found for category: {args.category}")
+                return
+        if feed_ids_filter:
+            best_df = _filter_by_feed_ids(best_df, feed_ids=feed_ids_filter)
+            if best_df.empty:
+                print(f"No results found for feed: {args.feed}")
+                return
+
+        # 懒删除：批量回查 SQLite，并删除已被 FreshRSS 删除的文章对应切片
+        best_df, _missing_ids = filter_deleted_entries(
+            best_df,
+            table=table,
+            sqlite_path=settings.freshrss_sqlite_path,
+        )
+
+        if best_df.empty:
+            print("No valid results after lazy deletion cleanup.")
+            return
+
+        rerank_model = args.rerank_model or settings.rerank_model
+        rerank_candidates = args.rerank_candidates or settings.rerank_candidates
+        if rerank_enabled:
+            rerank_candidates = max(rerank_candidates, limit * max_chunks_per_entry)
+        best_df = rerank_results(
+            best_df,
+            query=query,
+            limit=limit,
+            rerank_enabled=rerank_enabled,
+            rerank_model=rerank_model,
+            rerank_candidates=rerank_candidates,
+        )
+        best_df = best_df.head(limit)
+
+        feed_ids: list[int] = []
+        if "feed_id" in best_df.columns:
+            try:
+                feed_ids = [int(v) for v in best_df["feed_id"].dropna().unique().tolist()]
+            except Exception:  # noqa: BLE001
+                feed_ids = []
+        feed_id_to_name = _fetch_feed_id_to_name(
+            sqlite_path=settings.freshrss_sqlite_path,
+            feed_ids=feed_ids,
+        )
+
+        entry_ids: list[int] = []
+        if "entry_id" in best_df.columns:
+            try:
+                entry_ids = [int(v) for v in best_df["entry_id"].dropna().unique().tolist()]
+            except Exception:  # noqa: BLE001
+                entry_ids = []
+        entry_id_to_published_date = _fetch_entry_id_to_published_date(
+            sqlite_path=settings.freshrss_sqlite_path,
+            entry_ids=entry_ids,
+        )
+
+        # 最终结果输出为 JSONL（一行一个 JSON 对象）
+        results = _format_results_jsonl(
+            best_df.itertuples(index=False),
+            rerank_enabled=rerank_enabled,
+            feed_id_to_name=feed_id_to_name,
+            entry_id_to_published_date=entry_id_to_published_date,
+        )
+        for item in results:
+            print(json.dumps(item, ensure_ascii=False))
         return
 
+    # Multi-query path: staged map-reduce to maximize parallelism and avoid write conflicts.
+    query_vectors = get_query_embeddings(queries)
+    if query_vectors is None:
+        return
+    if len(query_vectors) != len(queries):
+        print(
+            "[search] Embedding size mismatch for queries: "
+            f"queries={len(queries)}, vectors={len(query_vectors)}",
+        )
+        return
+
+    max_workers = _resolve_max_workers(args.workers, task_count=len(queries))
+
+    def _search_one(query_vector: Sequence[float]) -> pd.DataFrame:
+        _table, df = search_vector_db(query_vector, limit)
+        return df
+
+    raw_dfs: list[pd.DataFrame] = [pd.DataFrame() for _ in queries]
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_search_one, vec): idx for idx, vec in enumerate(query_vectors)}
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                raw_dfs[idx] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[search] Error searching vector DB for query #{idx + 1}: {exc}")
+                raw_dfs[idx] = pd.DataFrame()
+
+    # Stage 2b: in-memory filtering only (no lazy deletion).
+    max_chunks_per_entry = 2 if rerank_enabled else 1
+    candidate_dfs: list[pd.DataFrame] = []
+    for df in raw_dfs:
+        if df.empty:
+            candidate_dfs.append(df)
+            continue
+
+        filtered_df = _apply_distance_threshold(df, threshold=settings.search_threshold)
+        if filtered_df.empty:
+            candidate_dfs.append(filtered_df)
+            continue
+
+        best_df = _pick_best_per_entry(filtered_df, max_chunks=max_chunks_per_entry)
+        if args.category:
+            best_df = _filter_by_category(best_df, category=args.category)
+        if feed_ids_filter:
+            best_df = _filter_by_feed_ids(best_df, feed_ids=feed_ids_filter)
+        candidate_dfs.append(best_df)
+
+    # Stage 3: consolidated lazy deletion (single sqlite lookup + single LanceDB delete).
+    non_empty_candidate_dfs = [df for df in candidate_dfs if not df.empty]
+    if non_empty_candidate_dfs:
+        combined_df = pd.concat(non_empty_candidate_dfs, ignore_index=True)
+        table = get_or_create_rss_chunks_table()
+        _filtered_combined_df, missing_ids = filter_deleted_entries(
+            combined_df,
+            table=table,
+            sqlite_path=settings.freshrss_sqlite_path,
+        )
+        if missing_ids:
+            candidate_dfs = [
+                df[~df["entry_id"].isin(missing_ids)] if (not df.empty and "entry_id" in df.columns) else df
+                for df in candidate_dfs
+            ]
+
+    # Stage 4: parallel rerank per query (after lazy deletion filtering).
     rerank_model = args.rerank_model or settings.rerank_model
     rerank_candidates = args.rerank_candidates or settings.rerank_candidates
     if rerank_enabled:
         rerank_candidates = max(rerank_candidates, limit * max_chunks_per_entry)
-    best_df = rerank_results(
-        best_df,
-        query=query,
-        limit=limit,
-        rerank_enabled=rerank_enabled,
-        rerank_model=rerank_model,
-        rerank_candidates=rerank_candidates,
-    )
-    best_df = best_df.head(limit)
 
-    feed_ids: list[int] = []
-    if "feed_id" in best_df.columns:
-        try:
-            feed_ids = [int(v) for v in best_df["feed_id"].dropna().unique().tolist()]
-        except Exception:  # noqa: BLE001
-            feed_ids = []
+    final_dfs: list[pd.DataFrame] = list(candidate_dfs)
+    if rerank_enabled:
+        rerank_task_indices = [idx for idx, df in enumerate(candidate_dfs) if not df.empty]
+        rerank_workers = _resolve_max_workers(args.workers, task_count=len(rerank_task_indices))
+        if rerank_task_indices:
+            with ThreadPoolExecutor(max_workers=rerank_workers) as executor:
+                futures = {
+                    executor.submit(
+                        rerank_results,
+                        candidate_dfs[idx],
+                        query=queries[idx],
+                        limit=limit,
+                        rerank_enabled=True,
+                        rerank_model=rerank_model,
+                        rerank_candidates=rerank_candidates,
+                    ): idx
+                    for idx in rerank_task_indices
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        final_dfs[idx] = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[search] Error reranking for query #{idx + 1}: {exc}")
+                        final_dfs[idx] = candidate_dfs[idx]
+
+    for idx, df in enumerate(final_dfs):
+        if not df.empty:
+            final_dfs[idx] = df.head(limit)
+
+    all_feed_ids: set[int] = set()
+    all_entry_ids: set[int] = set()
+    for df in final_dfs:
+        if df.empty:
+            continue
+        if "feed_id" in df.columns:
+            try:
+                all_feed_ids |= {int(v) for v in df["feed_id"].dropna().unique().tolist()}
+            except Exception:  # noqa: BLE001
+                pass
+        if "entry_id" in df.columns:
+            try:
+                all_entry_ids |= {int(v) for v in df["entry_id"].dropna().unique().tolist()}
+            except Exception:  # noqa: BLE001
+                pass
+
     feed_id_to_name = _fetch_feed_id_to_name(
         sqlite_path=settings.freshrss_sqlite_path,
-        feed_ids=feed_ids,
+        feed_ids=sorted(all_feed_ids),
     )
-
-    entry_ids: list[int] = []
-    if "entry_id" in best_df.columns:
-        try:
-            entry_ids = [int(v) for v in best_df["entry_id"].dropna().unique().tolist()]
-        except Exception:  # noqa: BLE001
-            entry_ids = []
     entry_id_to_published_date = _fetch_entry_id_to_published_date(
         sqlite_path=settings.freshrss_sqlite_path,
-        entry_ids=entry_ids,
+        entry_ids=sorted(all_entry_ids),
     )
 
-    # 最终结果输出为 JSONL（一行一个 JSON 对象）
-    results = _format_results_jsonl(
-        best_df.itertuples(index=False),
-        rerank_enabled=rerank_enabled,
-        feed_id_to_name=feed_id_to_name,
-        entry_id_to_published_date=entry_id_to_published_date,
-    )
-    for item in results:
-        print(json.dumps(item, ensure_ascii=False))
+    any_output = False
+    for idx, df in enumerate(final_dfs):
+        if df.empty:
+            continue
+        results = _format_results_jsonl(
+            df.itertuples(index=False),
+            rerank_enabled=rerank_enabled,
+            feed_id_to_name=feed_id_to_name,
+            entry_id_to_published_date=entry_id_to_published_date,
+        )
+        for item in results:
+            item["query"] = queries[idx]
+            print(json.dumps(item, ensure_ascii=False))
+            any_output = True
+
+    if not any_output:
+        print("No results found.")
 
 
 if __name__ == "__main__":
