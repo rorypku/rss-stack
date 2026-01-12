@@ -70,6 +70,15 @@ class Settings:
             default="https://api.siliconflow.cn/v1",
         )
 
+        # Query rewriting (optional; best-effort)
+        self.rewriting_enabled = get_env_bool("REWRITING_ENABLED", default=True)
+        self.rewriting_model = get_env_str(
+            "REWRITING_MODEL",
+            default="Pro/deepseek-ai/DeepSeek-V3.2",
+        )
+        self.rewriting_count = get_env_int("REWRITING_COUNT", default=3)
+        self.rewriting_timeout_seconds = get_env_int("REWRITING_TIMEOUT_SECONDS", default=15)
+
         # Embedding config
         self.embedding_model = get_env_str(
             "EMBEDDING_MODEL",
@@ -85,6 +94,7 @@ class Settings:
         self.search_threshold = float(os.getenv("SEARCH_THRESHOLD", "0.5"))
         self.search_candidate_multiplier = get_env_int("SEARCH_CANDIDATE_MULTIPLIER", default=20)
         self.search_candidate_cap = get_env_int("SEARCH_CANDIDATE_CAP", default=200)
+        self.search_workers = get_env_int("SEARCH_WORKERS", default=4)
 
         # Rerank (optional; app-layer rerank for stability across LanceDB versions)
         self.rerank_enabled = get_env_bool("RERANK_ENABLED", default=False)

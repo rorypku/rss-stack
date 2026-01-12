@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+import pandas as pd
 import requests
 
 from openai import OpenAI
@@ -67,7 +70,130 @@ def _clamp_positive(value: int, default: int) -> int:
     return value if value and value > 0 else default
 
 
-def get_query_embedding(text: str) -> list[float] | None:
+def _normalize_query_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _dedupe_keep_order(items: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    results: list[str] = []
+    for item in items:
+        normalized = _normalize_query_text(item)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        results.append(normalized)
+    return results
+
+
+def _parse_rewrite_queries(raw: str) -> list[str]:
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+
+    candidates: list[str] = []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("[")
+        end = raw.rfind("]")
+        if start >= 0 and end > start:
+            snippet = raw[start : end + 1]
+            try:
+                parsed = json.loads(snippet)
+            except Exception:  # noqa: BLE001
+                parsed = None
+        else:
+            parsed = None
+
+    if isinstance(parsed, list):
+        for item in parsed:
+            if isinstance(item, str):
+                candidates.append(item)
+            elif isinstance(item, dict):
+                value = item.get("query") or item.get("text") or item.get("rewrite")
+                if isinstance(value, str):
+                    candidates.append(value)
+
+    if not candidates:
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            line = re.sub(r"^\s*[\-\*\d\.\)\]]+\s*", "", line)
+            if line:
+                candidates.append(line)
+
+    return _dedupe_keep_order(candidates)
+
+
+def rewrite_query(original_query: str) -> list[str]:
+    settings = get_settings()
+    if not settings.rewriting_enabled:
+        return []
+
+    original_query = _normalize_query_text(original_query)
+    if not original_query:
+        return []
+
+    desired_count = max(1, int(settings.rewriting_count))
+
+    client = OpenAI(
+        api_key=settings.siliconflow_api_key,
+        base_url=settings.siliconflow_base_url,
+    )
+
+    system_prompt = (
+        "You are a search query rewriting assistant. "
+        "Rewrite the user's query into alternative queries that preserve intent, "
+        "add missing keywords, and expand abbreviations when helpful."
+    )
+    user_prompt = (
+        f"Generate {desired_count} rewritten search queries for the following input.\n"
+        "Requirements:\n"
+        "- Keep the same intent as the original query\n"
+        "- Each rewrite should be different and useful\n"
+        "- Do NOT include explanations\n"
+        "- Output ONLY a JSON array of strings\n\n"
+        f"Original query: {original_query}"
+    )
+
+    try:
+        try:
+            resp = client.chat.completions.create(
+                model=settings.rewriting_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+                timeout=max(1, settings.rewriting_timeout_seconds),
+            )
+        except TypeError:
+            resp = client.chat.completions.create(
+                model=settings.rewriting_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[search] Error calling rewriting API: {exc}")
+        return []
+
+    content = ""
+    try:
+        content = resp.choices[0].message.content or ""
+    except Exception:  # noqa: BLE001
+        content = ""
+
+    rewrites = _parse_rewrite_queries(content)
+    rewrites = [q for q in rewrites if q and q != original_query]
+    return rewrites[:desired_count]
+
+
+def get_query_embeddings(texts: Sequence[str]) -> list[list[float]] | None:
     settings = get_settings()
     client = OpenAI(
         api_key=settings.siliconflow_api_key,
@@ -76,7 +202,7 @@ def get_query_embedding(text: str) -> list[float] | None:
     try:
         resp = client.embeddings.create(
             model=settings.embedding_model,
-            input=[text],
+            input=list(texts),
             dimensions=settings.embedding_dim,
         )
     except Exception as exc:  # noqa: BLE001
@@ -87,7 +213,52 @@ def get_query_embedding(text: str) -> list[float] | None:
         print("[search] Empty embedding result for query.")
         return None
 
-    return resp.data[0].embedding
+    vectors = [item.embedding for item in resp.data]
+    if len(vectors) != len(texts):
+        print(f"[search] Embedding size mismatch: texts={len(texts)}, vectors={len(vectors)}")
+        return None
+
+    return vectors
+
+
+def _search_vectors_parallel(
+    table,
+    *,
+    vectors: Sequence[Sequence[float]],
+    limit: int,
+    max_workers: int,
+):
+    settings = get_settings()
+
+    candidate_limit = min(
+        limit * max(1, settings.search_candidate_multiplier),
+        max(limit, settings.search_candidate_cap),
+    )
+
+    def _search_one(vec: Sequence[float]):
+        return table.search(vec).limit(candidate_limit).to_pandas()
+
+    max_workers = max(1, int(max_workers))
+    max_workers = min(max_workers, len(vectors)) if vectors else 1
+
+    dfs = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_search_one, vec): idx for idx, vec in enumerate(vectors)}
+        for fut in as_completed(futures):
+            try:
+                df = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[search] Error during LanceDB search: {exc}")
+                continue
+            if df is None or df.empty:
+                continue
+            dfs.append(df)
+
+    if not dfs:
+        return pd.DataFrame()
+    if len(dfs) == 1:
+        return dfs[0]
+    return pd.concat(dfs, ignore_index=True)
 
 
 def search_vector_db(query_vector: Sequence[float], limit: int):
@@ -417,7 +588,7 @@ def main() -> None:
     args = parse_args()
     settings = get_settings()
 
-    query = args.query
+    query = _normalize_query_text(args.query)
     limit = _clamp_positive(args.limit, default=10)
 
     rerank_enabled = settings.rerank_enabled
@@ -426,11 +597,20 @@ def main() -> None:
     if args.no_rerank:
         rerank_enabled = False
 
-    query_vector = get_query_embedding(query)
-    if query_vector is None:
+    rewrites = rewrite_query(query)
+    variant_queries = _dedupe_keep_order([query, *rewrites])
+
+    query_vectors = get_query_embeddings(variant_queries)
+    if query_vectors is None:
         return
 
-    table, df = search_vector_db(query_vector, limit)
+    table = get_or_create_rss_chunks_table()
+    df = _search_vectors_parallel(
+        table,
+        vectors=query_vectors,
+        limit=limit,
+        max_workers=max(1, settings.search_workers),
+    )
     if df.empty:
         print("No results found.")
         return
@@ -438,6 +618,17 @@ def main() -> None:
     df = _apply_distance_threshold(df, threshold=settings.search_threshold)
     if df.empty:
         print("No results within threshold.")
+        return
+
+    # 懒删除：合并后批量回查 SQLite，并单次删除已被 FreshRSS 删除的文章对应切片
+    df, _missing_ids = filter_deleted_entries(
+        df,
+        table=table,
+        sqlite_path=settings.freshrss_sqlite_path,
+    )
+
+    if df.empty:
+        print("No valid results after lazy deletion cleanup.")
         return
 
     # Rerank 前每篇文章最多选取 2 个候选切片，避免只靠单个 chunk 表达不足。
@@ -457,17 +648,6 @@ def main() -> None:
         if best_df.empty:
             print(f"No results found for feed: {args.feed}")
             return
-
-    # 懒删除：批量回查 SQLite，并删除已被 FreshRSS 删除的文章对应切片
-    best_df, _missing_ids = filter_deleted_entries(
-        best_df,
-        table=table,
-        sqlite_path=settings.freshrss_sqlite_path,
-    )
-
-    if best_df.empty:
-        print("No valid results after lazy deletion cleanup.")
-        return
 
     rerank_model = args.rerank_model or settings.rerank_model
     rerank_candidates = args.rerank_candidates or settings.rerank_candidates
