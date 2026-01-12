@@ -551,6 +551,8 @@ def _format_results_jsonl(
         title = getattr(row, "title", "")
         feed_id = getattr(row, "feed_id", None)
         chunk = getattr(row, "content", "")
+        chunk_text = str(chunk or "")
+        chunk_prefix = chunk_text[:25]
 
         feed_name: str | None = None
         if feed_id is not None:
@@ -571,15 +573,12 @@ def _format_results_jsonl(
             published_date = _format_epoch_seconds_to_date(getattr(row, "published_at", None))
 
         item: dict[str, object] = {
+            "chunk_prefix": chunk_prefix,
             "feed.name": feed_name,
             "title": title,
-            "chunk": chunk,
             "published_date": published_date,
+            "chunk": chunk_text,
         }
-        if rerank_enabled:
-            score = getattr(row, "rerank_score", None)
-            if score is not None:
-                item["rerank_score"] = float(score)
         results.append(item)
     return results
 
