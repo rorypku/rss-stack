@@ -40,6 +40,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="optional FreshRSS feed.id (or feed.name) to filter results by",
     )
+    rewrite_group = parser.add_mutually_exclusive_group()
+    rewrite_group.add_argument(
+        "--rewrite",
+        action="store_true",
+        help="enable query rewriting (overrides env REWRITING_ENABLED)",
+    )
+    rewrite_group.add_argument(
+        "--no-rewrite",
+        action="store_true",
+        help="disable query rewriting (overrides env REWRITING_ENABLED)",
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--rerank",
@@ -127,9 +138,10 @@ def _parse_rewrite_queries(raw: str) -> list[str]:
     return _dedupe_keep_order(candidates)
 
 
-def rewrite_query(original_query: str) -> list[str]:
+def rewrite_query(original_query: str, *, rewriting_enabled: bool | None = None) -> list[str]:
     settings = get_settings()
-    if not settings.rewriting_enabled:
+    enabled = settings.rewriting_enabled if rewriting_enabled is None else bool(rewriting_enabled)
+    if not enabled:
         return []
 
     original_query = _normalize_query_text(original_query)
@@ -590,13 +602,19 @@ def main() -> None:
     query = _normalize_query_text(args.query)
     limit = _clamp_positive(args.limit, default=10)
 
+    rewriting_enabled = settings.rewriting_enabled
+    if args.rewrite:
+        rewriting_enabled = True
+    if args.no_rewrite:
+        rewriting_enabled = False
+
     rerank_enabled = settings.rerank_enabled
     if args.rerank:
         rerank_enabled = True
     if args.no_rerank:
         rerank_enabled = False
 
-    rewrites = rewrite_query(query)
+    rewrites = rewrite_query(query, rewriting_enabled=rewriting_enabled)
     variant_queries = _dedupe_keep_order([query, *rewrites])
 
     query_vectors = get_query_embeddings(variant_queries)
