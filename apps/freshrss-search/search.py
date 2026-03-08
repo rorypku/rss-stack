@@ -584,7 +584,9 @@ def _format_results_jsonl(
         if published_date is None:
             published_date = _format_epoch_seconds_to_date(getattr(row, "published_at", None))
 
+        normalized_entry_id = _normalize_int(entry_id)
         item: dict[str, object] = {
+            "entry_id": normalized_entry_id,
             "chunk_prefix": chunk_prefix,
             "feed.name": feed_name,
             "title": title,

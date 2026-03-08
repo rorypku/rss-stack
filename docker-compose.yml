@@ -3,6 +3,7 @@ services:
   freshrss:
     image: freshrss/freshrss:latest
     container_name: freshrss
+    restart: always
     environment:
       - TZ=Asia/Shanghai
       - CRON_MIN=*/30
@@ -24,7 +25,7 @@ services:
       dockerfile: Dockerfile
     image: rss-sync-worker
     container_name: rss_sync_worker
-    restart: unless-stopped
+    restart: always
     mem_limit: 1g
     environment:
       # --- SiliconFlow Config ---
@@ -33,7 +34,7 @@ services:
       - REWRITING_ENABLED=1
       - REWRITING_MODEL=Pro/deepseek-ai/DeepSeek-V3.2
       - REWRITING_COUNT=3
-      - REWRITING_TIMEOUT_SECONDS=15
+      - REWRITING_TIMEOUT_SECONDS=30
       - EMBEDDING_MODEL=Qwen/Qwen3-Embedding-8B
       - EMBEDDING_DIM=4096
 
@@ -78,6 +79,7 @@ services:
   rss-bridge:
     image: rssbridge/rss-bridge
     container_name: rss-bridge
+    restart: always
     ports:
       - "3000:80"
     volumes:
@@ -93,6 +95,7 @@ services:
   wechat2rss:
     image: "ttttmr/wechat2rss:latest"
     container_name: wechat2rss
+    restart: always
     environment:
       - LIC_EMAIL=${LIC_EMAIL} # 付款时备注的邮箱
       - LIC_CODE=${LIC_CODE} # 激活码
@@ -121,7 +124,7 @@ services:
       dockerfile: Dockerfile
     image: rsshub-custom
     container_name: rsshub
-    restart: unless-stopped
+    restart: always
     ports:
       - "1200:1200"
     environment:
@@ -173,7 +176,7 @@ services:
   browserless:
     image: browserless/chrome
     container_name: browserless
-    restart: unless-stopped
+    restart: always
     mem_limit: 1g
     ulimits:
       core:
@@ -195,7 +198,7 @@ services:
   redis:
     image: redis:alpine
     container_name: rsshub-redis
-    restart: unless-stopped
+    restart: always
     volumes:
       - ./data/redis:/data
     healthcheck:
