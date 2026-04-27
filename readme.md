@@ -16,7 +16,7 @@ uv run scripts/check_zsxq_token.py
 # 检查知识星球 token；如果检查失败，会弹出本地 macOS 通知：
 uv run scripts/check_zsxq_token_notify.py
 
-# 安装 macOS 定时检查：每天 06:00 自动检查，失败时弹窗通知：
+# 安装 macOS 定时检查：每天 00:00 / 06:00 / 12:00 / 18:00 自动检查，失败时弹窗通知：
 uv run scripts/install_zsxq_token_monitor_launchd.py
 
 # 查看定时检查日志：
